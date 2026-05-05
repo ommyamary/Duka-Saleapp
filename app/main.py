@@ -95,17 +95,35 @@ app.mount("/uploads", StaticFiles(directory=settings.upload_dir), name="uploads"
 
 def _coerce_datetimes(data: dict) -> dict:
     for k, v in data.items():
-        if isinstance(v, str) and (
-            k.endswith("_at") or 
-            k.endswith("_date") or 
-            k in ["date", "expiry", "start_time", "end_time", "payment_date"]
-        ):
+        if isinstance(v, str) and 'T' in v:
             try:
-                # Handle ISO format with 'Z' or offset
-                data[k] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                data[k] = datetime.fromisoformat(v.replace('Z', '+00:00'))
             except ValueError:
                 pass
     return data
+
+def generate_qr_code(product_id: str, sku: str) -> str:
+    """Generate QR code for a product and return base64 encoded image"""
+    # Create QR code data with product ID and SKU
+    qr_data = f"{product_id}:{sku}"
+    
+    # Generate QR code
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(qr_data)
+    qr.make(fit=True)
+    
+    # Create image and convert to base64
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    img_str = base64.b64encode(buffer.getvalue()).decode()
+    
+    return f"data:image/png;base64,{img_str}"
 
 def _resource_model(name: str):
     mapping = {
@@ -1672,10 +1690,17 @@ def get_product_by_code(code: str, current_user: User = Depends(require_cashier)
 def create_product(payload: ProductIn, current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
     if not current_user.company_id:
         raise HTTPException(status_code=400, detail="No company assigned")
-    data = payload.model_dump(exclude={"id", "company_id", "created_at", "updated_at"})
+    
+    product_id = str(uuid4())
+    data = payload.model_dump(exclude={"id", "company_id", "created_at", "updated_at", "qr_code"})
+    
+    # Generate QR code automatically
+    qr_code = generate_qr_code(product_id, payload.sku)
+    
     product = Product(
-        id=str(uuid4()),
+        id=product_id,
         company_id=current_user.company_id,
+        qr_code=qr_code,
         **data,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
@@ -1868,11 +1893,17 @@ def receive_purchase_order(
 
             if auto_create_products and not product:
                 new_product_id = product_id or str(uuid4())
+                sku = item.get("sku") or f"SKU-{new_product_id[:8]}"
+                
+                # Generate QR code automatically
+                qr_code = generate_qr_code(new_product_id, sku)
+                
                 product = Product(
                     id=new_product_id,
                     company_id=current_user.company_id,
                     name=item.get("productName", "Unknown"),
-                    sku=item.get("sku") or f"SKU-{new_product_id[:8]}",
+                    sku=sku,
+                    qr_code=qr_code,
                     quantity=qty_received,
                     category_id=item.get("categoryId"),
                     selling_price=float(item.get("sellingPrice", 0)),
