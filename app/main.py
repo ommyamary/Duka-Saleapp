@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import qrcode
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -385,6 +386,16 @@ def update_admin_user(user_id: str, payload: UserUpdate, _: User = Depends(requi
     db.refresh(user)
     return user
 
+@app.patch("/admin/users/{user_id}/toggle-status")
+def toggle_admin_user_status(user_id: str, _: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_active = not bool(user.is_active)
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    return {"id": user.id, "status": "active" if user.is_active else "suspended"}
+
 @app.delete("/admin/users/{user_id}")
 def delete_admin_user(user_id: str, _: User = Depends(require_super_admin), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
@@ -563,8 +574,59 @@ def update_company(company_id: str, payload: CompanyUpdate, _: User = Depends(re
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+    bank_details = data.pop("bank_details", None)
+    terms_conditions = data.pop("terms_conditions", None)
+
+    for key, value in data.items():
         setattr(company, key, value)
+
+    if bank_details is not None:
+        db.query(CompanyBankDetail).filter(CompanyBankDetail.company_id == company_id).delete()
+        for bank_detail in bank_details:
+            bank = CompanyBankDetail(
+                id=str(uuid4()),
+                company_id=company_id,
+                bank_name=bank_detail["bank_name"],
+                account_name=bank_detail["account_name"],
+                account_number=bank_detail["account_number"],
+                branch_name=bank_detail.get("branch_name"),
+                branch_code=bank_detail.get("branch_code"),
+                swift_code=bank_detail.get("swift_code"),
+                iban=bank_detail.get("iban"),
+                routing_number=bank_detail.get("routing_number"),
+                sort_code=bank_detail.get("sort_code"),
+                bank_address=bank_detail.get("bank_address"),
+                mobile_money_name=bank_detail.get("mobile_money_name"),
+                mobile_money_number=bank_detail.get("mobile_money_number"),
+                is_primary=bank_detail.get("is_primary", False),
+                is_active=bank_detail.get("is_active", True),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(bank)
+
+    if terms_conditions is not None:
+        db.query(CompanyTermsCondition).filter(CompanyTermsCondition.company_id == company_id).delete()
+        for terms in terms_conditions:
+            condition = CompanyTermsCondition(
+                id=str(uuid4()),
+                company_id=company_id,
+                document_type=terms["document_type"],
+                title=terms.get("title"),
+                terms_text=terms.get("terms_text"),
+                payment_terms=terms.get("payment_terms"),
+                delivery_terms=terms.get("delivery_terms"),
+                warranty_terms=terms.get("warranty_terms"),
+                return_policy=terms.get("return_policy"),
+                late_payment_terms=terms.get("late_payment_terms"),
+                cancellation_policy=terms.get("cancellation_policy"),
+                is_active=terms.get("is_active", True),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(condition)
+
     company.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(company)
@@ -755,24 +817,6 @@ def list_advertisements(
 ):
     return db.query(Advertisement).order_by(Advertisement.created_at.desc()).all()
 
-@app.get("/tenant/ads")
-def get_tenant_ads(
-    placement: str = Query("dashboard"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Get active advertisements for the tenant based on placement and company type
-    """
-    query = db.query(Advertisement).filter(
-        Advertisement.is_active == True,
-        Advertisement.placement == placement
-    )
-    
-    # Optional: Filter by company type if target_types is implemented on Advertisement model
-    # For now, return all active ads for that placement
-    return query.order_by(Advertisement.created_at.desc()).all()
-
 @app.delete("/admin/ads/{ad_id}")
 def delete_advertisement(
     ad_id: str,
@@ -870,6 +914,415 @@ def get_admin_dashboard_stats(_: User = Depends(require_super_admin), db: Sessio
         "recentCompanies": recent_companies,
         "recentActivity": activities
     }
+
+def _parse_period_range(period: str):
+    now = datetime.utcnow()
+    if period == "today":
+        start = datetime(now.year, now.month, now.day)
+    elif period == "this_week":
+        start = datetime(now.year, now.month, now.day) - timedelta(days=now.weekday())
+    elif period == "last_month":
+        current_month_start = datetime(now.year, now.month, 1)
+        month_end = current_month_start - timedelta(seconds=1)
+        start = datetime(month_end.year, month_end.month, 1)
+        return start, current_month_start
+    elif period == "this_year":
+        start = datetime(now.year, 1, 1)
+    else:  # this_month default
+        start = datetime(now.year, now.month, 1)
+    return start, now
+
+def _normalize_target(target: str | None):
+    if not target:
+        return "all"
+    value = str(target).strip().lower()
+    return value or "all"
+
+@app.get("/admin/users/activity")
+def list_admin_user_activity(
+    limit: int = Query(default=100, ge=10, le=500),
+    _: User = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    users = db.query(User).order_by(User.updated_at.desc()).limit(limit).all()
+    activities = []
+    for u in users:
+        activities.append({
+            "user_id": u.id,
+            "user_name": u.name,
+            "email": u.email,
+            "company_id": u.company_id,
+            "role": u.role,
+            "status": "active" if u.is_active else "suspended",
+            "created_at": u.created_at.isoformat() + "Z" if u.created_at else None,
+            "updated_at": u.updated_at.isoformat() + "Z" if u.updated_at else None,
+            "last_login": u.last_login.isoformat() + "Z" if getattr(u, "last_login", None) else None,
+        })
+    return activities
+
+@app.get("/admin/subscriptions/revenue")
+def get_admin_subscription_revenue(
+    period: str = Query(default="this_month"),
+    _: User = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    start_date, end_date = _parse_period_range(period)
+    plans = db.query(SubscriptionPlan).all()
+    companies = db.query(Company).filter(Company.is_active.is_(True)).all()
+
+    plan_price_by_name = {str(p.name).lower(): float(p.price or 0) for p in plans}
+    plan_price_by_id = {p.id: float(p.price or 0) for p in plans}
+    plan_revenue = {str(p.name): 0.0 for p in plans}
+    total_revenue = 0.0
+
+    for c in companies:
+        if c.created_at and c.created_at > end_date:
+            continue
+        if c.subscription_plan_id and c.subscription_plan_id in plan_price_by_id:
+            price = plan_price_by_id[c.subscription_plan_id]
+            plan = next((p for p in plans if p.id == c.subscription_plan_id), None)
+            if plan:
+                plan_revenue[str(plan.name)] = plan_revenue.get(str(plan.name), 0.0) + price
+                total_revenue += price
+            continue
+        label = str(c.subscription_plan or "free").lower()
+        price = plan_price_by_name.get(label, 0.0)
+        plan_revenue[label.capitalize()] = plan_revenue.get(label.capitalize(), 0.0) + price
+        total_revenue += price
+
+    trend = []
+    for idx in range(6):
+        d = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=(5 - idx) * 30)
+        month_label = d.strftime("%b")
+        active_until_month = [c for c in companies if c.created_at and c.created_at <= d + timedelta(days=31)]
+        value = 0.0
+        for c in active_until_month:
+            if c.subscription_plan_id and c.subscription_plan_id in plan_price_by_id:
+                value += plan_price_by_id[c.subscription_plan_id]
+            else:
+                value += plan_price_by_name.get(str(c.subscription_plan or "free").lower(), 0.0)
+        trend.append({"month": month_label, "revenue": round(value, 2)})
+
+    return {
+        "period": period,
+        "start_date": start_date.isoformat() + "Z",
+        "end_date": end_date.isoformat() + "Z",
+        "total_revenue": round(total_revenue, 2),
+        "plan_revenue": [{"plan": k, "revenue": round(v, 2)} for k, v in plan_revenue.items()],
+        "trend": trend,
+    }
+
+@app.get("/admin/subscriptions/billing-history")
+def get_admin_subscription_billing_history(
+    limit: int = Query(default=100, ge=10, le=500),
+    _: User = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    plans = db.query(SubscriptionPlan).all()
+    plan_price_by_name = {str(p.name).lower(): float(p.price or 0) for p in plans}
+    plan_price_by_id = {p.id: float(p.price or 0) for p in plans}
+    companies = db.query(Company).order_by(Company.updated_at.desc()).limit(limit).all()
+
+    rows = []
+    for c in companies:
+        amount = 0.0
+        plan_label = str(c.subscription_plan or "free")
+        if c.subscription_plan_id and c.subscription_plan_id in plan_price_by_id:
+            amount = plan_price_by_id[c.subscription_plan_id]
+            selected = next((p for p in plans if p.id == c.subscription_plan_id), None)
+            if selected:
+                plan_label = selected.name
+        else:
+            amount = plan_price_by_name.get(plan_label.lower(), 0.0)
+        rows.append({
+            "company_id": c.id,
+            "company_name": c.name,
+            "plan": plan_label,
+            "amount": round(amount, 2),
+            "status": "paid" if c.is_active else "inactive",
+            "billing_date": (c.updated_at or c.created_at).isoformat() + "Z",
+            "subscription_expiry": c.subscription_expiry.isoformat() + "Z" if c.subscription_expiry else None,
+        })
+    return rows
+
+@app.get("/admin/analytics/overview")
+def get_admin_analytics_overview(
+    period: str = Query(default="this_month"),
+    _: User = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    start_date, end_date = _parse_period_range(period)
+    transactions = db.query(Transaction).filter(Transaction.created_at >= start_date, Transaction.created_at <= end_date).all()
+    users = db.query(User).all()
+    companies = db.query(Company).all()
+    plans = db.query(SubscriptionPlan).all()
+
+    total_revenue = sum(float(t.total or 0) for t in transactions if t.type == "sale" and t.status == "completed")
+    total_transactions = len(transactions)
+    active_users = sum(1 for u in users if u.is_active)
+    active_companies = sum(1 for c in companies if c.is_active)
+
+    subscription_distribution = []
+    for plan in plans:
+        count = sum(1 for c in companies if c.subscription_plan_id == plan.id or str(c.subscription_plan or "").lower() == str(plan.name).lower())
+        percentage = (count / len(companies) * 100) if companies else 0
+        subscription_distribution.append({"plan": plan.name, "count": count, "percentage": round(percentage, 2)})
+
+    revenue_trend = []
+    signups_trend = []
+    tx_trend = []
+    for idx in range(6):
+        marker = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=(5 - idx) * 30)
+        month_end = marker + timedelta(days=31)
+        label = marker.strftime("%b")
+        month_tx = [t for t in transactions if marker <= t.created_at < month_end]
+        month_companies = [c for c in companies if c.created_at and marker <= c.created_at < month_end]
+        revenue_trend.append({"month": label, "value": round(sum(float(t.total or 0) for t in month_tx if t.type == "sale" and t.status == "completed"), 2)})
+        signups_trend.append({"month": label, "value": len(month_companies)})
+        tx_trend.append({"month": label, "value": len(month_tx)})
+
+    top_companies = []
+    for c in companies:
+        company_tx = [t for t in transactions if t.company_id == c.id and t.type == "sale" and t.status == "completed"]
+        top_companies.append({
+            "company_id": c.id,
+            "name": c.name,
+            "types": c.types or [],
+            "revenue": round(sum(float(t.total or 0) for t in company_tx), 2),
+            "transactions": len(company_tx),
+        })
+    top_companies.sort(key=lambda x: x["revenue"], reverse=True)
+
+    return {
+        "period": period,
+        "stats": {
+            "total_revenue": round(total_revenue, 2),
+            "total_transactions": total_transactions,
+            "total_companies": len(companies),
+            "active_companies": active_companies,
+            "total_users": len(users),
+            "active_users": active_users,
+        },
+        "subscription_distribution": subscription_distribution,
+        "revenue_trend": revenue_trend,
+        "signups_trend": signups_trend,
+        "transaction_trend": tx_trend,
+        "top_companies": top_companies[:10],
+    }
+
+@app.get("/admin/ads/analytics")
+def get_admin_ads_analytics(_: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    ads = db.query(Advertisement).order_by(Advertisement.created_at.desc()).all()
+    now = datetime.utcnow()
+
+    status_counts = {"active": 0, "scheduled": 0, "ended": 0, "paused": 0}
+    by_target = {}
+    by_placement = {}
+    timeline = []
+
+    for ad in ads:
+        if ad.is_active and ad.start_date <= now <= ad.end_date:
+            status_counts["active"] += 1
+        elif ad.is_active and ad.start_date > now:
+            status_counts["scheduled"] += 1
+        elif ad.is_active and ad.end_date < now:
+            status_counts["ended"] += 1
+        else:
+            status_counts["paused"] += 1
+
+        target_key = _normalize_target(ad.target)
+        by_target[target_key] = by_target.get(target_key, 0) + 1
+
+        placements = ad.placements or []
+        for p in placements:
+            p_key = str(p).strip().lower() or "dashboard"
+            by_placement[p_key] = by_placement.get(p_key, 0) + 1
+
+        timeline.append({
+            "label": (ad.created_at or now).strftime("%Y-%m"),
+            "count": 1,
+            "active": 1 if ad.is_active else 0,
+        })
+
+    timeline_map = {}
+    for item in timeline:
+        key = item["label"]
+        if key not in timeline_map:
+            timeline_map[key] = {"label": key, "count": 0, "active": 0}
+        timeline_map[key]["count"] += item["count"]
+        timeline_map[key]["active"] += item["active"]
+
+    return {
+        "summary": {
+            "total_ads": len(ads),
+            "active_ads": status_counts["active"],
+            "scheduled_ads": status_counts["scheduled"],
+            "ended_ads": status_counts["ended"],
+            "paused_ads": status_counts["paused"],
+        },
+        "status_breakdown": status_counts,
+        "target_breakdown": [{"target": k, "count": v} for k, v in by_target.items()],
+        "placement_breakdown": [{"placement": k, "count": v} for k, v in by_placement.items()],
+        "timeline": sorted(timeline_map.values(), key=lambda x: x["label"]),
+        "ads": ads,
+    }
+
+@app.get("/admin/system/overview")
+def get_admin_system_overview(_: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    tx_last_24h = db.query(Transaction).filter(Transaction.created_at >= now - timedelta(hours=24)).count()
+    users_last_24h = db.query(User).filter(User.created_at >= now - timedelta(hours=24)).count()
+    companies_last_24h = db.query(Company).filter(Company.created_at >= now - timedelta(hours=24)).count()
+
+    return {
+        "health": "healthy",
+        "uptime_hours": 24 * 7,
+        "database_status": "connected",
+        "last_24h": {
+            "transactions": tx_last_24h,
+            "new_users": users_last_24h,
+            "new_companies": companies_last_24h,
+        },
+        "totals": {
+            "users": db.query(User).count(),
+            "companies": db.query(Company).count(),
+            "transactions": db.query(Transaction).count(),
+            "ads": db.query(Advertisement).count(),
+        },
+    }
+
+@app.get("/admin/system/logs")
+def get_admin_system_logs(
+    limit: int = Query(default=100, ge=10, le=500),
+    _: User = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    logs = []
+    for c in db.query(Company).order_by(Company.updated_at.desc()).limit(limit // 2).all():
+        logs.append({
+            "level": "info",
+            "source": "company",
+            "message": f"Company updated: {c.name}",
+            "timestamp": (c.updated_at or c.created_at).isoformat() + "Z",
+        })
+    for ad in db.query(Advertisement).order_by(Advertisement.updated_at.desc()).limit(limit // 2).all():
+        logs.append({
+            "level": "info" if ad.is_active else "warning",
+            "source": "ads",
+            "message": f"Ad {'active' if ad.is_active else 'paused'}: {ad.title}",
+            "timestamp": (ad.updated_at or ad.created_at).isoformat() + "Z",
+        })
+    logs.sort(key=lambda x: x["timestamp"], reverse=True)
+    return logs[:limit]
+
+@app.get("/admin/system/notifications")
+def get_admin_system_notifications(_: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    notifications = []
+    expiring = db.query(Company).filter(Company.subscription_expiry.isnot(None)).all()
+    for c in expiring:
+        if c.subscription_expiry and 0 <= (c.subscription_expiry - now).days <= 14:
+            notifications.append({
+                "type": "subscription_expiry",
+                "severity": "warning",
+                "title": "Subscription expiring soon",
+                "message": f"{c.name} expires in {(c.subscription_expiry - now).days} day(s)",
+                "timestamp": now.isoformat() + "Z",
+            })
+    if not notifications:
+        notifications.append({
+            "type": "system",
+            "severity": "info",
+            "title": "All clear",
+            "message": "No urgent system notifications",
+            "timestamp": now.isoformat() + "Z",
+        })
+    return notifications
+
+_ADMIN_SETTINGS_FILE = Path(settings.upload_dir) / "admin_system_settings.json"
+
+def _default_admin_settings():
+    return {
+        "general": {
+            "platformName": "SaaS POS System",
+            "supportEmail": "support@saaspos.com",
+            "supportPhone": "+255000000000",
+            "defaultCurrency": "TSH",
+            "defaultTimezone": "Africa/Nairobi",
+            "maintenanceMode": False,
+        },
+        "email": {
+            "smtpHost": "",
+            "smtpPort": "587",
+            "smtpUser": "",
+            "smtpPassword": "",
+            "fromEmail": "noreply@saaspos.com",
+            "fromName": "SaaS POS System",
+        },
+        "security": {
+            "requireEmailVerification": True,
+            "twoFactorEnabled": False,
+            "passwordMinLength": 8,
+            "sessionTimeout": 60,
+            "maxLoginAttempts": 5,
+            "allowPublicRegistration": True,
+        },
+    }
+
+@app.get("/admin/settings")
+def get_admin_settings(_: User = Depends(require_super_admin)):
+    defaults = _default_admin_settings()
+    if _ADMIN_SETTINGS_FILE.exists():
+        try:
+            return json.loads(_ADMIN_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return defaults
+    return defaults
+
+@app.patch("/admin/settings")
+def update_admin_settings(payload: dict, _: User = Depends(require_super_admin)):
+    current = _default_admin_settings()
+    if _ADMIN_SETTINGS_FILE.exists():
+        try:
+            current = json.loads(_ADMIN_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            current = _default_admin_settings()
+    for section, value in payload.items():
+        if isinstance(value, dict):
+            current[section] = {**current.get(section, {}), **value}
+        else:
+            current[section] = value
+    _ADMIN_SETTINGS_FILE.write_text(json.dumps(current, ensure_ascii=True, indent=2), encoding="utf-8")
+    return current
+
+@app.get("/tenant/ads", response_model=list[AdvertisementOut])
+def list_tenant_ads(
+    placement: str = Query(default="dashboard"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    company = db.query(Company).filter(Company.id == current_user.company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    company_plan = str(company.subscription_plan or "free").lower()
+    now = datetime.utcnow()
+
+    ads = db.query(Advertisement).filter(
+        Advertisement.is_active.is_(True),
+        Advertisement.start_date <= now,
+        Advertisement.end_date >= now,
+    ).all()
+
+    filtered = []
+    for ad in ads:
+        target = _normalize_target(ad.target)
+        if target not in {"all", company_plan}:
+            continue
+        placements = [str(p).strip().lower() for p in (ad.placements or [])]
+        if placement.lower() not in placements:
+            continue
+        filtered.append(ad)
+    return filtered
 
 @app.get("/tenant/shift/summary")
 async def get_shift_summary(
@@ -1108,11 +1561,37 @@ def process_return(payload: dict, current_user: User = Depends(require_cashier),
     return_items = []
     total_refund = 0
     
+    previous_returns = db.query(Transaction).filter(
+        Transaction.company_id == current_user.company_id,
+        Transaction.type == "return",
+    ).all()
+
     for item in original_txn.items:
         item_id = item.get("id") or item.get("product_id")
         qty_to_return = float(return_qtys.get(item_id, 0))
+        sold_qty = float(item.get("quantity", 0))
+        if qty_to_return < 0:
+            raise HTTPException(status_code=400, detail="Return quantity cannot be negative")
+        
+        already_returned_qty = 0.0
+        if item_id:
+            for ret in previous_returns:
+                for ret_item in (ret.items or []):
+                    ret_item_id = ret_item.get("id") or ret_item.get("product_id")
+                    if (
+                        ret_item_id == item_id and
+                        ret_item.get("original_transaction_number") == original_txn.transaction_number
+                    ):
+                        already_returned_qty += float(ret_item.get("quantity", 0))
+        
+        max_returnable = max(0.0, sold_qty - already_returned_qty)
         
         if qty_to_return > 0:
+            if qty_to_return > max_returnable:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot return more than remaining quantity for item {item.get('name', item_id)}. Remaining: {max_returnable:g}"
+                )
             unit_price = float(item.get("unit_price") or item.get("price") or 0)
             line_total = qty_to_return * unit_price
             total_refund += line_total
@@ -2067,8 +2546,58 @@ def update_company_details(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     
-    for field, value in company_update.dict(exclude_unset=True).items():
+    data = company_update.dict(exclude_unset=True)
+    bank_details = data.pop("bank_details", None)
+    terms_conditions = data.pop("terms_conditions", None)
+
+    for field, value in data.items():
         setattr(company, field, value)
+
+    if bank_details is not None:
+        db.query(CompanyBankDetail).filter(CompanyBankDetail.company_id == current_user.company_id).delete()
+        for bank_detail in bank_details:
+            db_bank_detail = CompanyBankDetail(
+                id=str(uuid4()),
+                company_id=current_user.company_id,
+                bank_name=bank_detail["bank_name"],
+                account_name=bank_detail["account_name"],
+                account_number=bank_detail["account_number"],
+                branch_name=bank_detail.get("branch_name"),
+                branch_code=bank_detail.get("branch_code"),
+                swift_code=bank_detail.get("swift_code"),
+                iban=bank_detail.get("iban"),
+                routing_number=bank_detail.get("routing_number"),
+                sort_code=bank_detail.get("sort_code"),
+                bank_address=bank_detail.get("bank_address"),
+                mobile_money_name=bank_detail.get("mobile_money_name"),
+                mobile_money_number=bank_detail.get("mobile_money_number"),
+                is_primary=bank_detail.get("is_primary", False),
+                is_active=bank_detail.get("is_active", True),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(db_bank_detail)
+
+    if terms_conditions is not None:
+        db.query(CompanyTermsCondition).filter(CompanyTermsCondition.company_id == current_user.company_id).delete()
+        for terms in terms_conditions:
+            db_terms_condition = CompanyTermsCondition(
+                id=str(uuid4()),
+                company_id=current_user.company_id,
+                document_type=terms["document_type"],
+                title=terms.get("title"),
+                terms_text=terms.get("terms_text"),
+                payment_terms=terms.get("payment_terms"),
+                delivery_terms=terms.get("delivery_terms"),
+                warranty_terms=terms.get("warranty_terms"),
+                return_policy=terms.get("return_policy"),
+                late_payment_terms=terms.get("late_payment_terms"),
+                cancellation_policy=terms.get("cancellation_policy"),
+                is_active=terms.get("is_active", True),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(db_terms_condition)
     
     db.commit()
     db.refresh(company)
